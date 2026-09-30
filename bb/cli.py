@@ -1,4 +1,4 @@
-"""Command-line entry point for a reproducible, source-audited review run."""
+"""命令行入口:运行一次可复现、来源可审计的审查。"""
 
 from __future__ import annotations
 
@@ -23,18 +23,21 @@ from bb.time_audit import audit_time_scope
 
 
 def _write_json(path: Path, value: Any) -> None:
+    """把对象写成带缩进的 JSON 文件;"x" 模式保证不会覆盖已有文件。"""
     with path.open("x", encoding="utf-8") as stream:
         json.dump(value, stream, ensure_ascii=False, indent=2, default=str)
         stream.write("\n")
 
 
 def _read_questions(path: Path) -> list[dict[str, str]]:
+    """读取问题文件。元素可以是字符串,或含 "question"(可选 "id")的对象。"""
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, list):
         raise ValueError("Questions file must contain a JSON array")
     questions = []
     for index, item in enumerate(data):
         if isinstance(item, str):
+            # 纯字符串问题:自动编号 Q-001、Q-002 ...
             questions.append({"id": f"Q-{index + 1:03d}", "question": item})
         elif isinstance(item, dict) and isinstance(item.get("question"), str):
             questions.append({"id": str(item.get("id", f"Q-{index + 1:03d}")), "question": item["question"]})
@@ -44,6 +47,7 @@ def _read_questions(path: Path) -> list[dict[str, str]]:
 
 
 def _run_directory(parent: Path) -> Path:
+    """在输出根目录下创建本次运行专属目录:UTC 时间戳 + 6 位随机十六进制,避免冲突。"""
     parent.mkdir(parents=True, exist_ok=True)
     name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
     target = parent / name
@@ -52,22 +56,27 @@ def _run_directory(parent: Path) -> Path:
 
 
 def run(args: argparse.Namespace) -> Path:
+    """执行一次完整审查:索引文档 → 抽取/复用快照 → 计算 → 逐题调查 → 写出结果。"""
     started = time.monotonic()
     output = _run_directory(args.output)
 
     def progress(message: str) -> None:
+        """进度信息输出到 stderr,附 UTC 时间戳。"""
         timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
 
     progress("Indexing source documents")
+    # 为来源文档建立 SQLite 索引
     corpus = Corpus(args.documents, output / "index.sqlite3")
     model = make_model(args.provider, args.model, args.base_url)
     trace: list[dict[str, Any]] = []
     if args.snapshot:
+        # 复用已有抽取快照:必须模型一致、所有来源哈希一致,否则抛错
         progress("Validating reusable abstraction")
         snapshot = ReviewSnapshot.model_validate_json(args.snapshot.read_text(encoding="utf-8"))
         validate_snapshot_reuse(snapshot, args.model, corpus.manifest())
     else:
+        # 全新抽取流程:抽取 → 时间范围审计 → 事件对账
         cache_dir = args.output / "_stage_cache" if args.reuse_cache else None
         extraction, findings, extraction_trace = extract_corpus(
             corpus, model, max_chars=args.batch_chars,
@@ -92,18 +101,20 @@ def run(args: argparse.Namespace) -> Path:
         )
     _write_json(output / "abstraction.json", snapshot.model_dump())
     progress("Calculating event and weekly totals")
+    # 确定性计算事件与每周汇总(不让模型做加法)
     calculation = calculate_review(
         snapshot.reconciliation, snapshot.extraction, args.start, args.end, findings=snapshot.findings,
     )
     _write_json(output / "calculation.json", calculation)
     tools = EvidenceTools(corpus, snapshot, calculation)
     answers: list[dict[str, Any]] = []
+    # --prepare-only 时只生成抽取结果,不回答问题
     questions = [] if args.prepare_only else _read_questions(args.questions)
     reports = output / "reports"
     if questions:
         reports.mkdir(exist_ok=False)
-    offline_model_calls = model_call_count(trace)
-    online_model_calls = 0
+    offline_model_calls = model_call_count(trace)  # 离线阶段(抽取/对账)的模型调用数
+    online_model_calls = 0  # 回答问题阶段的模型调用数
     for number, item in enumerate(questions, 1):
         progress(f"Investigating question {item['id']}")
         result = answer_question(
@@ -123,22 +134,27 @@ def run(args: argparse.Namespace) -> Path:
                 "online_model_calls": question_calls,
             }
         )
+        # 每个问题单独生成一份 Markdown 报告
         markdown = render_answer_markdown(
             item["question"], result.answer, result.citations, corpus,
             question_calls, result.audit,
         )
         with (reports / f"question-{number:03d}.md").open("x", encoding="utf-8") as stream:
             stream.write(markdown)
+        # 把该问题的轨迹并入总轨迹,并标注所属问题 ID
         trace.extend({**entry, "question_id": item["id"]} for entry in result.trace)
         progress(f"Completed question {item['id']}")
     _write_json(output / "answers.json", answers)
+    # 轨迹以 JSONL 形式逐行保存
     with (output / "trace.jsonl").open("x", encoding="utf-8") as stream:
         for entry in trace:
             stream.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    # 汇总全程 token 用量
     usage = {
         "input_tokens": sum(entry.get("usage", {}).get("input_tokens", 0) for entry in trace),
         "output_tokens": sum(entry.get("usage", {}).get("output_tokens", 0) for entry in trace),
     }
+    # 写出本次运行的元数据
     _write_json(
         output / "run.json",
         {
@@ -164,6 +180,7 @@ def run(args: argparse.Namespace) -> Path:
 
 
 def main() -> None:
+    """解析命令行参数并启动审查。"""
     parser = argparse.ArgumentParser(description="Auditable, source-grounded clinical record review")
     parser.add_argument("--documents", type=Path, required=True)
     parser.add_argument("--questions", type=Path, help="JSON questions file, unless --prepare-only is used")
@@ -180,6 +197,7 @@ def main() -> None:
     parser.add_argument("--max-tool-calls", type=int, default=12)
     parser.add_argument("--max-model-turns", type=int, default=6)
     args = parser.parse_args()
+    # --prepare-only 与 --questions 互斥;非 prepare-only 模式必须提供 --questions
     if args.prepare_only and args.questions:
         parser.error("--prepare-only and --questions cannot be used together")
     if not args.prepare_only and not args.questions:

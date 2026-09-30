@@ -1,4 +1,4 @@
-"""Verify whether extracted clock intervals describe patient contact or service activity."""
+"""核实抽取出的时钟区间描述的是患者的实际接触时间,还是服务/活动的时间范围。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from bb.repair import generate_checked_json
 from bb.source import Corpus
 
 
+# 时间范围审计的系统提示词(发给模型的原文,保持英文不变)
 TIME_SCOPE_SYSTEM = """Audit the provenance and scope of extracted clock intervals. Return one JSON object:
 {"decisions":[{"mention_id":"...","patient_actual_supported":true|false|null,"reason":"..."}]}.
 
@@ -26,6 +27,12 @@ def audit_time_scope(
     cache_dir: Path | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[list[AuditFinding], list[dict[str, Any]]]:
+    """审计小组治疗记录里的"实际时间段"是否真的属于该患者;返回 (审计发现, 调用轨迹)。
+
+    注意:判定为"不属于患者"的提及,其 actual_intervals 会被就地清空。
+    """
+    # 只审计这类提及:临床记录、小组治疗,且同时有"实际时间段"和"计划时间段"
+    # (两者并存时,最容易把小组整体时间误当成患者自己的时间)
     candidates = [
         mention for mention in extraction.events
         if mention.document_role == "clinical"
@@ -37,6 +44,7 @@ def audit_time_scope(
         return [], []
     if progress:
         progress(f"Auditing patient-time scope for {len(candidates)} clinical group mentions")
+    # 给模型的载荷:已抽取的时间段 + 文档全文,让它对照原文判断
     payload = [
         {
             "mention_id": mention.mention_id,
@@ -52,9 +60,10 @@ def audit_time_scope(
     cache_path = cache.path("time_scope", model.model_name, TIME_SCOPE_SYSTEM, serialized) if cache else None
     result = cache.read(cache_path) if cache_path else None
 
-    expected = {mention.mention_id for mention in candidates}
+    expected = {mention.mention_id for mention in candidates}  # 必须逐一给出判定的提及 ID
 
     def validation_errors(data: dict[str, Any]) -> list[str]:
+        """校验模型输出:结构正确、判定值合法、ID 不重复且与候选集完全一致。"""
         decisions = data.get("decisions")
         if not isinstance(decisions, list):
             return ["decisions must be an array"]
@@ -66,14 +75,17 @@ def audit_time_scope(
                 continue
             identifiers.append(str(decision.get("mention_id")))
             verdict = decision.get("patient_actual_supported")
+            # 判定值只能是 true / false / null
             if verdict is not True and verdict is not False and verdict is not None:
                 errors.append(f"decisions[{index}].patient_actual_supported must be true, false, or null")
         if len(identifiers) != len(set(identifiers)):
             errors.append("Duplicate mention IDs in time-scope decisions")
+        # 不能遗漏,也不能出现未知 ID
         if set(identifiers) != expected:
             errors.append(f"Missing IDs: {sorted(expected - set(identifiers))}; unknown IDs: {sorted(set(identifiers) - expected)}")
         return errors
 
+    # 缓存内容若不能通过当前校验,则视为未命中
     if result is not None and validation_errors(result):
         result = None
     if result is None:
@@ -93,6 +105,7 @@ def audit_time_scope(
         decision = by_id[mention.mention_id]
         verdict = decision.get("patient_actual_supported")
         if verdict is False:
+            # 判定为"只是服务/小组层面的时间":清空患者实际时间段,并记录原值以便审计
             original = [item.model_dump() for item in mention.actual_intervals]
             mention.actual_intervals = []
             findings.append(
@@ -103,6 +116,7 @@ def audit_time_scope(
                 )
             )
         elif verdict is None:
+            # 无法判断:保留原值,但记为"时间范围不确定"(会使汇总被标记为不完整)
             findings.append(
                 AuditFinding(
                     code="time_scope_uncertain",
@@ -110,6 +124,7 @@ def audit_time_scope(
                     source_refs=[mention.anchor().reference()],
                 )
             )
+    # 结果校验通过后才写缓存
     if cache_path and not cache_path.exists():
         StageCache.write(cache_path, result)
     trace.append({"stage": "time_scope_decisions", "decisions": decisions})
